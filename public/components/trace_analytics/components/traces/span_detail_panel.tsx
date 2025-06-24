@@ -17,17 +17,20 @@ import {
 } from '@elastic/eui';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useObservable from 'react-use/lib/useObservable';
+import type PlotlyType from 'plotly.js';
+import { get } from 'lodash';
 import { HttpSetup } from '../../../../../../../src/core/public';
 import { TraceAnalyticsMode } from '../../../../../common/types/trace_analytics';
+import { BarOrientation } from '../../../../../common/constants/shared';
 import { coreRefs } from '../../../../framework/core_refs';
 import { Plt } from '../../../visualizations/plotly/plot';
-import { hitsToSpanDetailData } from '../../requests/traces_request_handler';
-import { TraceFilter } from '../common/constants';
-import { PanelTitle, parseHits } from '../common/helper_functions';
+import { hitsToHierarchicalSpans, parseSpanHitData } from '../../requests/traces_request_handler';
+import { HierarchicalSpan, TRACE_CHART_ROW_HEIGHT, TraceFilter } from '../common/constants';
+import { nanoToMilliSec, PanelTitle, parseHits } from '../common/helper_functions';
 import { SpanDetailFlyout } from './span_detail_flyout';
 import { SpanDetailTable, SpanDetailTableHierarchy } from './span_detail_table';
 
-export function SpanDetailPanel(props: {
+interface SpanDetailPanelProps {
   http: HttpSetup;
   traceId: string;
   colorMap: any;
@@ -38,31 +41,28 @@ export function SpanDetailPanel(props: {
   setSpanFiltersWithStorage: (newFilters: TraceFilter[]) => void;
   page?: string;
   openSpanFlyout?: any;
-  data?: { gantt: any[]; table: any[]; ganttMaxX: number };
-  setGanttData?: (data: { gantt: any[]; table: any[]; ganttMaxX: number }) => void;
   isApplicationFlyout?: boolean;
   payloadData: string;
   isGanttChartLoading?: boolean;
   setGanttChartLoading?: (loading: boolean) => void;
-}) {
+}
+
+export function SpanDetailPanel(props: SpanDetailPanelProps) {
   const { chrome } = coreRefs;
   const { mode } = props;
   const fromApp = props.page === 'app';
 
-  let data: { gantt: any[]; table: any[]; ganttMaxX: number };
-  let setData: (data: { gantt: any[]; table: any[]; ganttMaxX: number }) => void;
-  const [localData, localSetData] = useState<{ gantt: any[]; table: any[]; ganttMaxX: number }>({
+  const [data, setData] = useState<{
+    gantt: PlotlyType.PlotData[];
+    ganttAnnotations: Partial<PlotlyType.Annotations>[];
+    ganttMax: number;
+  }>({
     gantt: [],
-    table: [],
-    ganttMaxX: 0,
+    ganttAnnotations: [],
+    ganttMax: 0,
   });
-  if (props.data && props.setGanttData) {
-    [data, setData] = [props.data, props.setGanttData];
-  } else {
-    [data, setData] = [localData, localSetData];
-  }
-  const fullRange = [0, data.ganttMaxX * 1.1];
-  const [selectedRange, setSelectedRange] = useState(fullRange);
+  const fullRange: [number, number] = [0, data.ganttMax * 1.1];
+  const [selectedRange, setSelectedRange] = useState<[number, number]>([0, 0]);
   const isLocked = useObservable(chrome!.getIsNavDrawerLocked$() ?? false);
   const [isFullScreen, setIsFullScreen] = useState(false);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -104,11 +104,6 @@ export function SpanDetailPanel(props: {
     return isLocked ? availableWidth - adjustment : availableWidth - leftNavAdjustment;
   }, [isLocked, availableWidth]);
 
-  // Update selectedRange whenever data.ganttMaxX changes to ensure it starts fully zoomed out
-  useEffect(() => {
-    setSelectedRange(fullRange);
-  }, [data.ganttMaxX]);
-
   const addSpanFilter = (field: string, value: any) => {
     const newFilters = [...props.spanFilters];
     const index = newFilters.findIndex(({ field: filterField }) => field === filterField);
@@ -136,91 +131,130 @@ export function SpanDetailPanel(props: {
     }
 
     const hits = parseHits(props.payloadData);
+    const hierarchicalSpans = hitsToHierarchicalSpans(hits, mode);
+    const startTimeInMs = Math.min(
+      ...hierarchicalSpans.map((span) => nanoToMilliSec(span.startTimeInNanos))
+    );
 
-    if (hits.length === 0) {
-      return;
-    }
+    const { data, annotations, maxX } = createPlotlyData(
+      hierarchicalSpans,
+      mode,
+      props.colorMap,
+      startTimeInMs
+    );
 
-    hitsToSpanDetailData(hits, props.colorMap, mode)
-      .then((transformedData) => {
-        setData(transformedData);
-      })
-      .catch((error) => {
-        console.error('Error in hitsToSpanDetailData:', error);
-      })
-      .finally(() => {
-        props.setGanttChartLoading?.(false);
-      });
-  }, [props.payloadData, props.colorMap, mode, props.spanFilters]);
+    setData({ gantt: data, ganttAnnotations: annotations, ganttMax: maxX });
+    // Update selectedRange whenever data changes to ensure it starts fully zoomed out
+    setSelectedRange([0, maxX * 1.1]);
 
-  const getSpanDetailLayout = (
-    plotTraces: Plotly.Data[],
-    _maxX: number
-  ): Partial<Plotly.Layout> => {
-    const dynamicWidthAdjustment = !isLocked
-      ? 200
-      : newNavigation
-      ? 390 // If locked and new navigation
-      : 410; // If locked and new navigation is disabled
+    props.setGanttChartLoading?.(false);
+  }, [props.payloadData, mode, props.colorMap]);
+
+  const layout: Partial<PlotlyType.Layout> = useMemo(() => {
     // get unique labels from traces
-    const yLabels = plotTraces
-      .map((d) => d.y[0])
-      .filter((label, i, self) => self.indexOf(label) === i);
-    // remove uuid when displaying y-ticks
-    const yTexts = yLabels.map((label) => label.substring(0, label.length - 36));
-
-    // Calculate the maximum label length dynamically
-    const maxLabelLength = Math.max(...yTexts.map((text) => text.length));
-
-    // Dynamically set left margin based on the longest label
-    let dynamicLeftMargin = Math.max(150, maxLabelLength * 5);
-    dynamicLeftMargin = Math.min(dynamicLeftMargin, 500);
+    const yLabels = data.gantt.map((d) => d.y[0]);
+    const topMargin = 20;
 
     return {
-      plot_bgcolor: 'rgba(0, 0, 0, 0)',
-      paper_bgcolor: 'rgba(0, 0, 0, 0)',
-      height: 25 * plotTraces.length + 60,
+      height: TRACE_CHART_ROW_HEIGHT * data.gantt.length + topMargin,
       width: props.isApplicationFlyout
         ? availableWidth / 2 - 100 // Allow gantt chart to fit in flyout
-        : availableWidth - dynamicWidthAdjustment, // Allow gantt chart to render full screen
+        : availableWidth, // Allow gantt chart to render full screen
       margin: {
-        l: dynamicLeftMargin,
-        r: 5,
-        b: 30,
-        t: 30,
+        l: 2,
+        r: 2,
+        b: 2,
+        t: topMargin,
       },
       xaxis: {
         ticksuffix: ' ms',
-        side: 'top',
-        color: '#91989c',
-        showline: true,
-        range: selectedRange, // Apply selected range to main chart
+        side: 'top' as const,
+        color: '#5e6d82',
+        showgrid: true,
+        gridcolor: 'rgba(226, 232, 240, 0.5)',
+        showline: false,
+        zeroline: false,
+        range: selectedRange, // Apply selected range to the x-axis
       },
       yaxis: {
-        showgrid: false,
+        visible: false,
         tickvals: yLabels,
-        ticktext: yTexts,
-        fixedrange: true, // Prevent panning/scrolling in main chart
+        fixedrange: true,
+        autorange: 'reversed',
       },
+      annotations: data.ganttAnnotations.map((annotation, i) => {
+        // Adjust annotation (trace name) position to stay within the visible range when zoomed
+        // If annotation starts before the visible range but the span extends into it,
+        // move the annotation to the start of the visible range
+        let normalizedX = annotation.x as number;
+        if (
+          normalizedX < selectedRange[0] &&
+          annotation.y === data.gantt[i].y[0] &&
+          ((data.gantt[i] as any).base as number) + (data.gantt[i].x[0] as number) >
+            selectedRange[0]
+        ) {
+          normalizedX = selectedRange[0];
+        }
+        return {
+          ...annotation,
+          x: normalizedX,
+        };
+      }),
+      shapes: [
+        {
+          // grid border
+          type: 'rect',
+          xref: 'paper',
+          yref: 'paper',
+          x0: 0,
+          x1: 1,
+          y0: 0,
+          y1: 1,
+          line: {
+            color: 'rgba(226, 232, 240, 1)',
+            width: 1,
+          },
+          fillcolor: 'rgba(0,0,0,0)',
+        },
+      ],
     };
-  };
-
-  const layout = useMemo(() => getSpanDetailLayout(data.gantt, data.ganttMaxX), [
-    data.gantt,
-    data.ganttMaxX,
-    selectedRange,
-    availableWidth,
-    isLocked,
-    isFullScreen,
-  ]);
-  const miniMapLayout = {
-    ...layout,
-    height: 100,
-    dragmode: 'select', // Allow users to define their zoom range
-    xaxis: { ...layout.xaxis, range: fullRange },
-    yaxis: { visible: false, fixedrange: true },
+  }, [data.gantt, data.ganttAnnotations, selectedRange, availableWidth, isLocked, isFullScreen]);
+  const miniMapLayout: Partial<PlotlyType.Layout> = {
+    width: layout.width,
+    height: 80,
+    margin: layout.margin,
+    dragmode: 'select',
+    selectdirection: 'h',
+    xaxis: {
+      ticksuffix: ' ms',
+      side: 'top' as const,
+      color: '#5e6d82',
+      showgrid: true,
+      gridcolor: 'rgba(226, 232, 240, 0.5)',
+      range: [fullRange[0], fullRange[1]],
+      showline: false,
+      zeroline: false,
+      fixedrange: true,
+    },
+    yaxis: { visible: false, fixedrange: true, autorange: 'reversed' },
     shapes: [
       {
+        // grid border
+        type: 'rect',
+        xref: 'paper',
+        yref: 'paper',
+        x0: 0,
+        x1: 1,
+        y0: 0,
+        y1: 1,
+        fillcolor: 'rgba(0,0,0,0)',
+        line: {
+          color: 'rgba(226, 232, 240, 1)',
+          width: 1,
+        },
+      },
+      {
+        // range highlight box
         type: 'rect',
         xref: 'x',
         yref: 'paper',
@@ -228,54 +262,16 @@ export function SpanDetailPanel(props: {
         x1: selectedRange[1],
         y0: 0,
         y1: 1,
-        fillcolor: 'rgba(128, 128, 128, 0.3)', // Highlight the selection area
+        fillcolor: 'rgba(0, 120, 212, 0.1)',
         line: {
           width: 1,
-          color: 'rgba(255, 0, 0, 0.6)', // Border of the selection
+          color: 'rgba(0, 120, 212, 0.2)',
         },
-        editable: true,
       },
     ],
   };
 
-  const miniMap = useMemo(
-    () => (
-      <Plt
-        data={data.gantt.map((trace) => ({
-          ...trace,
-        }))}
-        layout={miniMapLayout}
-        onSelectedHandler={(event) => {
-          if (event && event.range) {
-            const { x } = event.range;
-            setSelectedRange(x); // Update selected range to reflect user-defined zoom
-          }
-        }}
-        onRelayout={(event) => {
-          if (event && event['shapes[0].x0'] && event['shapes[0].x1']) {
-            // Update selected range when the shape (rectangle) is moved
-            setSelectedRange([event['shapes[0].x0'], event['shapes[0].x1']]);
-          }
-        }}
-      />
-    ),
-    [data.gantt, miniMapLayout, setSelectedRange]
-  );
-
   const [currentSpan, setCurrentSpan] = useState('');
-
-  const onClick = useCallback(
-    (event: any) => {
-      if (!event?.points) return;
-      const point = event.points[0];
-      if (fromApp) {
-        props.openSpanFlyout(point.data.spanId);
-      } else {
-        setCurrentSpan(point.data.spanId);
-      }
-    },
-    [props.openSpanFlyout, setCurrentSpan, fromApp]
-  );
 
   const renderFilters = useMemo(() => {
     return props.spanFilters.map(({ field, value }) => (
@@ -292,22 +288,27 @@ export function SpanDetailPanel(props: {
     ));
   }, [props.spanFilters]);
 
-  const onHover = useCallback(() => {
-    const dragLayer = document.getElementsByClassName('nsewdrag')?.[0];
-    dragLayer.style.cursor = 'pointer';
-  }, []);
-
-  const onUnhover = useCallback(() => {
-    const dragLayer = document.getElementsByClassName('nsewdrag')?.[0];
-    dragLayer.style.cursor = '';
-  }, []);
+  const onClick = useCallback(
+    (event: any) => {
+      console.log('onClick', event);
+      if (!event?.points) return;
+      const point = event.points[0];
+      if (fromApp) {
+        props.openSpanFlyout(point.data.spanId);
+      } else {
+        setCurrentSpan(point.data.spanId);
+      }
+    },
+    [props.openSpanFlyout, setCurrentSpan, fromApp]
+  );
 
   const onRelayoutHandler = useCallback(
-    (event) => {
-      // Handle x-axis range update
-      if (event && event['xaxis.range[0]'] && event['xaxis.range[1]']) {
-        const newRange = [event['xaxis.range[0]'], event['xaxis.range[1]']];
-        setSelectedRange(newRange);
+    (event: PlotlyType.PlotSelectionEvent) => {
+      const x0 = get(event, 'xaxis.range[0]', null) || get(event, 'selections[0].x0', null);
+      const x1 = get(event, 'xaxis.range[1]', null) || get(event, 'selections[0].x1', null);
+      if (x0 && x1) {
+        // Update selected range when the shape (rectangle) is moved
+        setSelectedRange([x0, x1]);
       } else {
         setSelectedRange(fullRange);
       }
@@ -379,27 +380,27 @@ export function SpanDetailPanel(props: {
     [setCurrentSpan, dynamicLayoutAdjustment, props.payloadData, props.spanFilters]
   );
 
+  const miniMap = useMemo(
+    () => (
+      <Plt
+        data={data.gantt}
+        config={{
+          editable: false,
+          doubleClick: 'reset',
+        }}
+        layout={miniMapLayout}
+        onRelayout={onRelayoutHandler}
+      />
+    ),
+    [data.gantt, miniMapLayout, setSelectedRange]
+  );
+
+  const ganttChartRef = useRef<HTMLDivElement>(null);
   const ganttChart = useMemo(
     () => (
       <Plt
-        data={data.gantt.map((trace) => {
-          const hasError = trace.text && trace.text[0] && trace.text[0].includes('Error');
-
-          if (hasError) {
-            return {
-              ...trace,
-            };
-          }
-
-          const duration = trace.x[0] ? trace.x[0].toFixed(2) : '0.00'; // Format duration to 2 decimal places
-
-          return {
-            ...trace,
-            text: `${duration} ms`,
-            textposition: 'outside',
-            hoverinfo: 'none',
-          };
-        })}
+        ref={ganttChartRef}
+        data={data.gantt}
         layout={layout}
         onClickHandler={onClick}
         onHoverHandler={onHover}
@@ -407,7 +408,7 @@ export function SpanDetailPanel(props: {
         onRelayout={onRelayoutHandler}
       />
     ),
-    [data.gantt, layout, onClick, onHover, onUnhover, setSelectedRange]
+    [data.gantt, layout]
   );
 
   return (
@@ -465,12 +466,14 @@ export function SpanDetailPanel(props: {
 
               {toggleIdSelected === 'timeline' && <EuiFlexItem grow={false}>{miniMap}</EuiFlexItem>}
 
-              <EuiFlexItem style={{ overflowY: 'auto', maxHeight: 500 }}>
-                {toggleIdSelected === 'timeline'
-                  ? ganttChart
-                  : toggleIdSelected === 'span_list'
-                  ? spanDetailTable
-                  : spanDetailTableHierarchy}
+              <EuiFlexItem style={{ overflowY: 'auto', maxHeight: 400 }}>
+                <div ref={containerRef}>
+                  {toggleIdSelected === 'timeline'
+                    ? ganttChart
+                    : toggleIdSelected === 'span_list'
+                    ? spanDetailTable
+                    : spanDetailTableHierarchy}
+                </div>
               </EuiFlexItem>
             </>
           )}
@@ -491,3 +494,85 @@ export function SpanDetailPanel(props: {
     </>
   );
 }
+
+const setCursor = (target: HTMLElement, cursor: string) => {
+  const container = (target as HTMLElement).closest('.js-plotly-plot');
+  const dragLayerElements = container?.getElementsByClassName('nsewdrag');
+  if (!dragLayerElements || dragLayerElements.length === 0) return;
+  const dragLayer = dragLayerElements[0] as HTMLElement;
+  if (dragLayer) {
+    dragLayer.style.cursor = cursor;
+  }
+};
+
+const onHover = (e: PlotlyType.PlotMouseEvent) => {
+  const target = e.event.target;
+  if (!target) return;
+  setCursor(target as HTMLElement, 'pointer');
+};
+
+const onUnhover = (e: PlotlyType.PlotMouseEvent) => {
+  const target = e.event.target;
+  if (!target) return;
+  setCursor(target as HTMLElement, '');
+};
+
+const createPlotlyData = (
+  spans: HierarchicalSpan[],
+  mode: TraceAnalyticsMode,
+  colorMap: Record<string, string>,
+  startTimeInMs: number
+) => {
+  const data: PlotlyType.PlotData[] = [];
+  const annotations: Partial<PlotlyType.Annotations>[] = [];
+  let maxX = 0;
+
+  const processSpan = (span: HierarchicalSpan) => {
+    const delayInMs = nanoToMilliSec(span.startTimeInNanos) - startTimeInMs;
+
+    const { spanId, durationInMs, serviceName, name, error } = parseSpanHitData(span.hit, mode);
+    maxX = Math.max(maxX, delayInMs + durationInMs);
+
+    const spanBar: PlotlyType.PlotData = {
+      x: [durationInMs],
+      y: [spanId],
+      name: '',
+      customdata: [spanId, durationInMs, delayInMs],
+      marker: {
+        color: colorMap[serviceName],
+      },
+      width: 0.4,
+      // @ts-ignore plotly outdated type?? https://plotly.com/javascript/reference/bar/#bar-base
+      base: delayInMs,
+      type: 'bar',
+      orientation: BarOrientation.horizontal,
+      spanId,
+      hoverinfo: 'none',
+    };
+    data.push(spanBar);
+
+    const spanBarLabel: Partial<PlotlyType.Annotations> = {
+      x: delayInMs,
+      y: spanId,
+      text: `${
+        error ? `<span style="color: red;">${error}</span>&nbsp;&nbsp;` : ''
+      }${serviceName}: ${name} - ${durationInMs.toFixed(2)}ms`,
+      align: 'left',
+      showarrow: false,
+      xanchor: 'left',
+      valign: 'bottom',
+      height: TRACE_CHART_ROW_HEIGHT,
+      yshift: 0,
+      bgcolor: 'rgba(255,0,0,0)',
+      borderpad: 0,
+      borderwidth: 0,
+    };
+    annotations.push(spanBarLabel);
+
+    // recursively process children
+    span.children.sort((a, b) => a.startTimeInNanos - b.startTimeInNanos).forEach(processSpan);
+  };
+
+  spans.sort((a, b) => a.startTimeInNanos - b.startTimeInNanos).forEach(processSpan);
+  return { data, annotations, maxX };
+};

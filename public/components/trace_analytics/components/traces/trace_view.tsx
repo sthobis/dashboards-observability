@@ -35,9 +35,9 @@ import { coreRefs } from '../../../../framework/core_refs';
 import { HeaderControlledComponentsWrapper } from '../../../../plugin_helpers/plugin_headerControl';
 import { TraceAnalyticsCoreDeps } from '../../home';
 import { handleServiceMapRequest } from '../../requests/services_request_handler';
-import { handlePayloadRequest } from '../../requests/traces_request_handler';
+import { handlePayloadRequest, parseSpanHitData } from '../../requests/traces_request_handler';
 import { TraceFilter } from '../common/constants';
-import { PanelTitle, filtersToDsl, processTimeStamp } from '../common/helper_functions';
+import { PanelTitle, filtersToDsl, parseHits, processTimeStamp } from '../common/helper_functions';
 import { ServiceMap, ServiceObject } from '../common/plots/service_map';
 import { redirectTraceToLogs } from '../common/redirection_helpers';
 import { ServiceBreakdownPanel } from './service_breakdown_panel';
@@ -77,13 +77,7 @@ export function TraceView(props: TraceViewProps) {
   const [serviceBreakdownData, setServiceBreakdownData] = useState([]);
   const [payloadData, setPayloadData] = useState('');
   const [colorMap, setColorMap] = useState({});
-  const [ganttData, setGanttData] = useState<{ gantt: any[]; table: any[]; ganttMaxX: number }>({
-    gantt: [],
-    table: [],
-    ganttMaxX: 0,
-  });
   const [serviceMap, setServiceMap] = useState<ServiceObject>({});
-  const [traceFilteredServiceMap, setTraceFilteredServiceMap] = useState<ServiceObject>({});
   const [serviceMapIdSelected, setServiceMapIdSelected] = useState<
     'latency' | 'error_rate' | 'throughput'
   >('latency');
@@ -336,23 +330,36 @@ export function TraceView(props: TraceViewProps) {
     }
   }, [payloadData, mode]);
 
-  useEffect(() => {
-    if (!Object.keys(serviceMap).length || !ganttData.table.length) return;
-    const services: any = {};
-    ganttData.table.forEach((service: any) => {
-      if (!services[service.service_name]) {
-        services[service.service_name] = {
+  const traceFilteredServiceMap = useMemo(() => {
+    if (!Object.keys(serviceMap).length || !filteredPayload.length) return {};
+    const spans = parseHits(filteredPayload);
+
+    const services: Record<
+      string,
+      {
+        latency: number;
+        errors: number;
+        throughput: number;
+      }
+    > = {};
+
+    spans.forEach((span) => {
+      const { serviceName, durationInMs, error } = parseSpanHitData(span, mode);
+
+      if (!services[serviceName]) {
+        services[serviceName] = {
           latency: 0,
           errors: 0,
           throughput: 0,
         };
       }
-      services[service.service_name].latency += service.latency;
-      if (service.error) services[service.service_name].errors++;
-      services[service.service_name].throughput++;
+      services[serviceName].latency += durationInMs;
+      if (error) services[serviceName].errors++;
+      services[serviceName].throughput++;
     });
+
     const filteredServiceMap: ServiceObject = {};
-    Object.entries(services).forEach(([serviceName, service]: [string, any]) => {
+    Object.entries(services).forEach(([serviceName, service]) => {
       if (!serviceMap[serviceName]) return;
       filteredServiceMap[serviceName] = serviceMap[serviceName];
       filteredServiceMap[serviceName].latency = round(service.latency / service.throughput, 2);
@@ -365,8 +372,8 @@ export function TraceView(props: TraceViewProps) {
         serviceName
       ].destServices.filter((destService) => services[destService]);
     });
-    setTraceFilteredServiceMap(filteredServiceMap);
-  }, [serviceMap, ganttData]);
+    return filteredServiceMap;
+  }, [serviceMap, filteredPayload]);
 
   useEffect(() => {
     setNavBreadCrumbs(
@@ -432,15 +439,13 @@ export function TraceView(props: TraceViewProps) {
             </EuiFlexItem>
           </EuiFlexGroup>
           <EuiSpacer size="m" />
-          <EuiFlexGroup>
-            <EuiFlexItem>
+          <EuiFlexGroup gutterSize="s">
+            <EuiFlexItem style={{ width: '100%' }}>
               <SpanDetailPanel
                 traceId={props.traceId}
                 http={props.http}
                 colorMap={colorMap}
                 mode={mode}
-                data={ganttData}
-                setGanttData={setGanttData}
                 dataSourceMDSId={props.dataSourceMDSId[0].id}
                 dataSourceMDSLabel={props.dataSourceMDSId[0].label}
                 payloadData={filteredPayload}

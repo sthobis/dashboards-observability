@@ -9,15 +9,12 @@ import get from 'lodash/get';
 import omitBy from 'lodash/omitBy';
 import round from 'lodash/round';
 import moment from 'moment';
-import { v1 as uuid } from 'uuid';
 import { HttpSetup } from '../../../../../../src/core/public';
-import { BarOrientation } from '../../../../common/constants/shared';
 import { TRACE_ANALYTICS_DATE_FORMAT } from '../../../../common/constants/trace_analytics';
 import { TraceAnalyticsMode, TraceQueryMode } from '../../../../common/types/trace_analytics';
 import { coreRefs } from '../../../../public/framework/core_refs';
-import { MILI_TO_SEC } from '../components/common/constants';
+import { Span, ParsedHit, HierarchicalSpan } from '../components/common/constants';
 import {
-  getTimestampPrecision,
   microToMilliSec,
   nanoToMilliSec,
   parseIsoToNano,
@@ -237,106 +234,27 @@ export const handleSpansFlyoutRequest = (
     });
 };
 
-export const hitsToSpanDetailData = async (hits: any, colorMap: any, mode: TraceAnalyticsMode) => {
-  const data: { gantt: any[]; table: any[]; ganttMaxX: number } = {
-    gantt: [],
-    table: [],
-    ganttMaxX: 0,
-  };
-  if (hits.length === 0) return data;
-
-  const timestampPrecision = getTimestampPrecision(hits[hits.length - 1].sort[0]);
-
-  const minStartTime = (() => {
-    switch (timestampPrecision) {
-      case 'micros':
-        return microToMilliSec(hits[hits.length - 1].sort[0]);
-      case 'nanos':
-        return nanoToMilliSec(hits[hits.length - 1].sort[0]);
-      default:
-        // 'millis'
-        return hits[hits.length - 1].sort[0];
-    }
-  })();
-
-  let maxEndTime = 0;
-
-  hits.forEach((hit: any) => {
-    const startTime = (() => {
-      switch (timestampPrecision) {
-        case 'micros':
-          return microToMilliSec(hit.sort[0]) - minStartTime;
-        case 'nanos':
-          return nanoToMilliSec(hit.sort[0]) - minStartTime;
-        default:
-          // 'millis'
-          return hit.sort[0] - minStartTime;
-      }
-    })();
-
-    const duration =
-      mode === 'jaeger'
-        ? round(microToMilliSec(hit._source.duration), 2)
-        : round(nanoToMilliSec(hit._source.durationInNanos), 2);
-    const serviceName =
-      mode === 'jaeger'
-        ? get(hit, ['_source', 'process']).serviceName
-        : get(hit, ['_source', 'serviceName']);
-    const name = mode === 'jaeger' ? get(hit, '_source.operationName') : get(hit, '_source.name');
-    const error =
-      mode === 'jaeger'
-        ? hit._source.tag?.['error'] === true
-          ? ' \u26a0 Error'
-          : ''
-        : hit._source['status.code'] === 2
+export const parseSpanHitData = (span: ParsedHit, mode: TraceAnalyticsMode) => {
+  const spanId = mode === 'jaeger' ? get(span._source, ['spanID']) : get(span._source, ['spanId']);
+  const durationInMs =
+    mode === 'jaeger'
+      ? round(microToMilliSec(get(span._source, ['duration'])), 2)
+      : round(nanoToMilliSec(get(span._source, ['durationInNanos'])), 2);
+  const serviceName =
+    mode === 'jaeger'
+      ? get(span._source, ['process']).serviceName
+      : get(span._source, ['serviceName']);
+  const name =
+    mode === 'jaeger' ? get(span._source, ['operationName']) : get(span._source, ['name']);
+  const error =
+    mode === 'jaeger'
+      ? get(span._source, ['tag'])?.['error'] === true
         ? ' \u26a0 Error'
-        : '';
-    const uniqueLabel = `${serviceName} <br>${name} ` + uuid();
-    maxEndTime = Math.max(maxEndTime, startTime + duration);
-
-    data.table.push({
-      service_name: serviceName,
-      span_id: hit._source.spanID,
-      latency: duration,
-      vs_benchmark: 0,
-      error,
-      start_time: hit._source.startTime,
-      end_time: hit._source.endTime,
-    });
-    data.gantt.push(
-      {
-        x: [startTime],
-        y: [uniqueLabel],
-        marker: {
-          color: 'rgba(0, 0, 0, 0)',
-        },
-        width: 0.4,
-        type: 'bar',
-        orientation: BarOrientation.horizontal,
-        hoverinfo: 'none',
-        showlegend: false,
-        spanId: mode === 'jaeger' ? hit._source.spanID : hit._source.spanId,
-      },
-      {
-        x: [duration],
-        y: [uniqueLabel],
-        text: [error],
-        textfont: { color: ['#c14125'] },
-        textposition: 'outside',
-        marker: {
-          color: colorMap[serviceName],
-        },
-        width: 0.4,
-        type: 'bar',
-        orientation: BarOrientation.horizontal,
-        hovertemplate: '%{x}<extra></extra>',
-        spanId: mode === 'jaeger' ? hit._source.spanID : hit._source.spanId,
-      }
-    );
-  });
-
-  data.ganttMaxX = maxEndTime;
-  return data;
+        : ''
+      : get(span._source, ['status.code']) === 2
+      ? ' \u26a0 Error'
+      : '';
+  return { spanId, durationInMs, serviceName, name, error };
 };
 
 interface Hit {
@@ -361,6 +279,12 @@ export function normalizePayload(parsed: ParsedResponse): Hit[] {
   return [];
 }
 
+const getStartTimeInNanos = (hit: ParsedHit, mode: TraceAnalyticsMode) => {
+  return mode === 'jaeger'
+    ? Number(hit._source.startTime) * 1000 // jaeger uses microseconds
+    : parseIsoToNano(hit._source.startTime);
+};
+
 export const handlePayloadRequest = (
   traceId: string,
   http: HttpSetup,
@@ -374,10 +298,7 @@ export const handlePayloadRequest = (
       const normalizedData = normalizePayload(response);
       const sortedData = normalizedData
         .map((hit) => {
-          const time =
-            mode === 'jaeger'
-              ? Number(hit._source.startTime) * MILI_TO_SEC
-              : parseIsoToNano(hit._source.startTime);
+          const time = getStartTimeInNanos(hit, mode);
 
           return {
             ...hit,
@@ -414,4 +335,84 @@ export const handleSpansRequest = (
         toastLifeTimeMs: 10000,
       });
     });
+};
+
+type SpanMap = Record<string, HierarchicalSpan>;
+
+type SpanReference = {
+  refType: 'CHILD_OF' | 'FOLLOWS_FROM';
+  spanID: string;
+};
+
+const addRootSpan = (
+  spanId: string,
+  spanMap: SpanMap,
+  rootSpans: HierarchicalSpan[],
+  alreadyAddedRootSpans: Set<string>
+) => {
+  if (!alreadyAddedRootSpans.has(spanId)) {
+    rootSpans.push(spanMap[spanId]);
+    alreadyAddedRootSpans.add(spanId);
+  }
+};
+
+export const hitsToHierarchicalSpans = (hits: ParsedHit[], mode: TraceAnalyticsMode) => {
+  const spanMap: SpanMap = {};
+  hits.forEach((hit) => {
+    const spanIdKey = mode === 'jaeger' ? 'spanID' : 'spanId';
+    spanMap[(hit._source as Span & { spanID: string })[spanIdKey]] = {
+      hit,
+      startTimeInNanos: getStartTimeInNanos(hit, mode),
+      children: [],
+    };
+  });
+
+  const rootSpans: HierarchicalSpan[] = [];
+  const alreadyAddedRootSpans: Set<string> = new Set(); // Track added root spans
+
+  hits.forEach((hit) => {
+    if (mode === 'jaeger') {
+      const spanIdKey = 'spanID';
+      const source = hit._source as Span & { spanID: string; references: SpanReference[] };
+      const references: SpanReference[] = source.references || [];
+      references.forEach((ref: SpanReference) => {
+        if (ref.refType === 'CHILD_OF') {
+          const parentSpan = spanMap[ref.spanID];
+          if (parentSpan) {
+            if (!parentSpan.children) {
+              parentSpan.children = [];
+            }
+            parentSpan.children.push(spanMap[source[spanIdKey]]);
+          }
+        }
+
+        if (ref.refType === 'FOLLOWS_FROM' && !alreadyAddedRootSpans.has(source[spanIdKey])) {
+          addRootSpan(source[spanIdKey], spanMap, rootSpans, alreadyAddedRootSpans);
+        }
+      });
+
+      if (references.length === 0 || references.every((ref) => ref.refType === 'FOLLOWS_FROM')) {
+        addRootSpan(source[spanIdKey], spanMap, rootSpans, alreadyAddedRootSpans);
+      }
+    } else {
+      // Data Prepper
+      const spanIdKey = 'spanId';
+      const source = hit._source;
+      if (source.parentSpanId && spanMap[source.parentSpanId]) {
+        const parentSpan = spanMap[source.parentSpanId];
+        if (!parentSpan.children) {
+          parentSpan.children = [];
+        }
+        if (spanMap[source[spanIdKey]]) {
+          parentSpan.children.push(spanMap[source[spanIdKey]]);
+        }
+      } else {
+        if (source[spanIdKey] && spanMap[source[spanIdKey]]) {
+          addRootSpan(source[spanIdKey], spanMap, rootSpans, alreadyAddedRootSpans);
+        }
+      }
+    }
+  });
+
+  return rootSpans;
 };

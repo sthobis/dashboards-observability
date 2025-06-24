@@ -10,6 +10,8 @@ export const MILI_TO_SEC = 1000;
 
 export const MAX_DISPLAY_ROWS = 10000;
 
+export const TRACE_CHART_ROW_HEIGHT = 50;
+
 export const pieChartColors = [
   '#7492e7',
   '#c33d69',
@@ -52,6 +54,12 @@ export interface Span {
     name: string;
     version: string;
   };
+}
+
+export interface HierarchicalSpan {
+  hit: ParsedHit;
+  startTimeInNanos: number;
+  children: HierarchicalSpan[];
 }
 
 export interface ParsedHit {

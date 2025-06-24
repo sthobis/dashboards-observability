@@ -4,7 +4,7 @@
  */
 
 import Plotly from 'plotly.js-dist';
-import React from 'react';
+import React, { forwardRef, ForwardedRef } from 'react';
 import plotComponentFactory from 'react-plotly.js/factory';
 import { uiSettingsService } from '../../../../common/utils';
 
@@ -16,12 +16,12 @@ interface PltProps {
   onUnhoverHandler?: (event: Readonly<Plotly.PlotMouseEvent>) => void;
   onClickHandler?: (event: Readonly<Plotly.PlotMouseEvent>) => void;
   onSelectedHandler?: (event: Readonly<Plotly.PlotSelectionEvent>) => void;
-  onRelayout?: (event: Readonly<Plotly.PlotSelectionEvent>) => void;
+  onRelayout?: (event: Readonly<Plotly.PlotRelayoutEvent>) => void;
   height?: string;
   dispatch?: (props: any) => void;
 }
 
-export function Plt(props: PltProps) {
+export const Plt = forwardRef((props: PltProps, ref: ForwardedRef<HTMLDivElement>) => {
   const PlotComponent = plotComponentFactory(Plotly);
   const darkLayout = uiSettingsService.get('theme:darkMode')
     ? {
@@ -33,7 +33,7 @@ export function Plt(props: PltProps) {
       }
     : {};
 
-  const finalLayout = {
+  const finalLayout: Partial<Plotly.Layout> = {
     autosize: true,
     barmode: 'stack',
     legend: {
@@ -75,6 +75,7 @@ export function Plt(props: PltProps) {
 
   return (
     <PlotComponent
+      ref={ref}
       divId="explorerPlotComponent"
       data={props.data}
       style={{ width: '100%', height: props.height || '100%' }}
@@ -88,4 +89,4 @@ export function Plt(props: PltProps) {
       layout={finalLayout}
     />
   );
-}
+});
